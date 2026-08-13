@@ -7,7 +7,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/beck-8/subs-check/config"
+	"github.com/jadylc/subs-check/config"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/dns"
 )

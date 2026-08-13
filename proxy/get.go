@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -16,8 +17,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/beck-8/subs-check/config"
-	"github.com/beck-8/subs-check/utils"
+	"github.com/jadylc/subs-check/config"
+	"github.com/jadylc/subs-check/utils"
 	"github.com/metacubex/mihomo/common/convert"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/samber/lo"
@@ -80,6 +81,14 @@ func GetProxies() ([]map[string]any, error) {
 			var con map[string]any
 			err = yaml.Unmarshal(data, &con)
 			if err != nil {
+				// Some subscription providers return base64-encoded Clash YAML
+				// config when they detect a Clash-like User-Agent. The YAML may
+				// also contain duplicate top-level keys (providers concatenate
+				// multiple config snippets). Try to decode and extract proxies.
+				con = tryDecodeBase64ClashYAML(data)
+			}
+			if con == nil {
+				data = fixVMessURLSafeBase64(data)
 				proxyList, err := convert.ConvertsV2Ray(data)
 				if err != nil {
 					slog.Error("解析proxy错误", "source", e.source, "url", url, "err", err)
@@ -350,4 +359,136 @@ func newMihomoDialer(dialTimeout time.Duration) func(ctx context.Context, networ
 		}
 		return nil, fmt.Errorf("dial %s: %w", host, dialErr)
 	}
+}
+
+// fixVMessURLSafeBase64 preprocesses vmess share links to fix two issues that
+// cause mihomo's tryDecodeBase64 to fail, resulting in vmess nodes being
+// silently skipped with "url.Port() is empty" warnings:
+//  1. URL-safe base64 characters (- and _) in the vmess body — mihomo only
+//     tries RawStdEncoding and StdEncoding, not URLEncoding.
+//  2. A "#fragment" suffix appended after the base64 body — the "#" character
+//     is not valid base64 and causes CorruptInputError. The fragment is
+//     redundant because the node name is already in the JSON "ps" field.
+func fixVMessURLSafeBase64(data []byte) []byte {
+	// Try to decode outer base64 (subscription data is typically base64-encoded)
+	var decoded []byte
+	var wasBase64 bool
+	if d, err := base64.StdEncoding.DecodeString(string(data)); err == nil {
+		decoded = d
+		wasBase64 = true
+	} else if d, err := base64.RawStdEncoding.DecodeString(string(data)); err == nil {
+		decoded = d
+		wasBase64 = true
+	} else {
+		// Not base64 - treat as plain text proxy URLs
+		decoded = data
+	}
+
+	// Fix vmess links
+	lines := strings.Split(string(decoded), "\n")
+	modified := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "vmess://") {
+			continue
+		}
+
+		original := trimmed
+
+		// Strip "#fragment" suffix — "#" is not valid base64 and causes
+		// tryDecodeBase64 to fail. The node name is in the JSON "ps" field.
+		if idx := strings.Index(trimmed, "#"); idx >= 0 {
+			trimmed = trimmed[:idx]
+		}
+
+		// Convert URL-safe base64 characters to standard base64
+		body := strings.TrimPrefix(trimmed, "vmess://")
+		if strings.ContainsAny(body, "-_") {
+			body = strings.ReplaceAll(body, "-", "+")
+			body = strings.ReplaceAll(body, "_", "/")
+		}
+
+		lines[i] = "vmess://" + body
+		if lines[i] != original {
+			modified = true
+		}
+	}
+
+	if !modified {
+		return data
+	}
+
+	fixed := []byte(strings.Join(lines, "\n"))
+	// If original was base64-encoded, re-encode to keep ConvertsV2Ray's
+	// DecodeBase64 path working the same way
+	if wasBase64 {
+		return []byte(base64.StdEncoding.EncodeToString(fixed))
+	}
+	return fixed
+}
+
+// tryDecodeBase64ClashYAML attempts to decode base64-encoded Clash YAML config
+// data and extract proxy entries. This handles subscription providers that
+// return different content based on User-Agent: when a Clash-like UA is used,
+// they may return base64-encoded Clash YAML instead of V2Ray share links.
+//
+// The YAML may contain duplicate top-level "proxies:" keys (providers
+// concatenate multiple config snippets). yaml.v3 rejects duplicate keys, so
+// when that happens we fall back to extracting flow-style proxy entries
+// ("- {name: ..., type: ...}") line by line.
+//
+// Returns a map with a "proxies" key containing the extracted proxy list,
+// or nil if the data is not base64-encoded Clash YAML.
+func tryDecodeBase64ClashYAML(data []byte) map[string]any {
+	// Step 1: Try base64 decode
+	var decoded []byte
+	if d, err := base64.StdEncoding.DecodeString(string(data)); err == nil {
+		decoded = d
+	} else if d, err := base64.RawStdEncoding.DecodeString(string(data)); err == nil {
+		decoded = d
+	} else {
+		return nil
+	}
+
+	// Step 2: Try standard YAML parse (handles clean configs without duplicates)
+	var con map[string]any
+	if err := yaml.Unmarshal(decoded, &con); err == nil {
+		if _, ok := con["proxies"]; ok {
+			return con
+		}
+		return nil
+	}
+
+	// Step 3: YAML has duplicate keys — extract flow-style proxy entries
+	// from text. Each entry is a single-line YAML flow map like:
+	//   - {name: ..., server: ..., type: vless, ...}
+	lines := strings.Split(string(decoded), "\n")
+	inProxies := false
+	var proxyList []any
+	for _, line := range lines {
+		line = strings.TrimRight(line, "\r")
+		// Track top-level "proxies:" sections (no indentation)
+		if line == "proxies:" {
+			inProxies = true
+			continue
+		}
+		// Exit proxies mode on any other top-level key
+		if len(line) > 0 && line[0] != ' ' && line[0] != '-' && line[0] != '\t' {
+			inProxies = false
+			continue
+		}
+		// Parse flow-style entries ("- {name: ...}")
+		if inProxies && strings.HasPrefix(line, "- {") {
+			entry := strings.TrimPrefix(line, "- ")
+			var p map[string]any
+			if err := yaml.Unmarshal([]byte(entry), &p); err == nil {
+				proxyList = append(proxyList, p)
+			}
+		}
+	}
+
+	if len(proxyList) == 0 {
+		return nil
+	}
+	return map[string]any{"proxies": proxyList}
 }

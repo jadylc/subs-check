@@ -210,7 +210,7 @@ sub-urls-retry: 3
 sub-urls-concurrent: 20
 # 获取订阅时使用的UA；如果设置random将会使用随机UA获取订阅
 # sub-urls-get-ua: "random"
-sub-urls-get-ua: "clash.meta (https://github.com/beck-8/subs-check)"
+sub-urls-get-ua: "clash.meta (https://github.com/jadylc/subs-check)"
 # Github Proxy，获取订阅使用，结尾要带的 /
 # github-proxy: "https://ghfast.top/"
 github-proxy: ""

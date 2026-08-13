@@ -91,7 +91,7 @@ var GlobalConfig = &Config{
 	Platforms:          []string{"openai", "youtube", "netflix", "disney", "gemini", "iprisk"},
 	DownloadMB:         20,
 	AliveTestUrl:       "http://gstatic.com/generate_204",
-	SubUrlsGetUA:       "clash.meta (https://github.com/beck-8/subs-check)",
+	SubUrlsGetUA:       "clash.meta (https://github.com/jadylc/subs-check)",
 	SubUrlsReTry:       3,
 	SubUrlsConcurrent:  20,
 }
