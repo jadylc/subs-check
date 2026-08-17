@@ -22,7 +22,8 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v4
         with:
-          go-version: stable
+          go-version: '1.24'
+          cache: true
       - name: Release
         uses: goreleaser/goreleaser-action@v4
         with:
@@ -86,9 +87,8 @@ jobs:
             type=match,pattern=^(.*-beta.*)$,group=1,enable=${{ contains(github.ref_name, 'beta') }}
             # 如果 tag 不包含 "beta"，生成版本标签
             type=match,pattern=^v(.*)$,group=1,enable=${{ !contains(github.ref_name, 'beta') }}
-          flavor: |
-            # 明确控制 latest 标签，只有当不包含 "beta" 时才生成
-            latest=${{ !contains(github.ref_name, 'beta') }}
+            # 非 beta 版本额外生成 latest 标签
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, 'beta') }}
           
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
