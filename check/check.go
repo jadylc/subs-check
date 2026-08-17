@@ -40,11 +40,13 @@ type Result struct {
 	IPRisk     string
 	Country    string
 	Speed      int // KB/s, 0 表示未测速或测速未通过
+	Latency    int // ms, 测活阶段 HTTP 请求耗时, 0 表示未测活
 }
 
 // aliveResult 存活检测通过的中间结果
 type aliveResult struct {
-	Proxy map[string]any
+	Proxy   map[string]any
+	Latency int // ms, 测活请求耗时
 }
 
 // ProxyChecker 处理代理检测的主要结构体
@@ -52,10 +54,12 @@ type aliveResult struct {
 // MediaDone / FilterPassed / SpeedDone / SpeedOk) so both the CLI progress
 // UI and the web admin API can read them without plumbing through a pointer.
 type ProxyChecker struct {
-	results    []Result
-	proxyCount int
-	progress   int32 // alive-stage done count; shared with showProgress
-	available  int32 // alive-stage pass count;  shared with showProgress
+	results       []Result
+	proxyCount    int
+	progress      int32 // alive-stage done count; shared with showProgress
+	available     int32 // alive-stage pass count;  shared with showProgress
+	aliveSubStats map[string]int
+	aliveSubMu    sync.Mutex
 }
 
 var Progress atomic.Uint32
@@ -95,6 +99,59 @@ func GetPhaseResult(phase int) *PhaseResult {
 		return PhaseResults[phase].Load()
 	}
 	return nil
+}
+
+// NodeDetail 单个通过节点的展示明细。
+type NodeDetail struct {
+	Name    string `json:"name"`
+	Country string `json:"country"`
+	Latency int    `json:"latency"` // ms, 测活请求耗时
+	Speed   int    `json:"speed"`   // KB/s, 0 表示未测速或未通过
+}
+
+// SubNodeStat 按订阅链接维度的节点统计。
+type SubNodeStat struct {
+	URL       string       `json:"url"`
+	Tag       string       `json:"tag"`
+	Total     int          `json:"total"`  // 该订阅的总节点数
+	Alive     int          `json:"alive"`  // 该订阅的存活节点数
+	Passed    int          `json:"passed"` // 该订阅通过全部检测的节点数
+	Nodes     []NodeDetail `json:"nodes"`
+	resultIdx []int        // 不导出 JSON;记录每个 node 在 results slice 中的位置,用于后续更新 name
+}
+
+// 包级缓存: 上一轮有效运行的按订阅链接分组的统计数据。
+var (
+	lastSubStats   []SubNodeStat
+	lastSubStatsMu sync.RWMutex
+	lastTotalNodes uint32
+	lastAliveNodes uint32
+)
+
+// GetLastSubStats 返回缓存的上一轮按订阅链接分组的统计快照。
+func GetLastSubStats() ([]SubNodeStat, uint32, uint32) {
+	lastSubStatsMu.RLock()
+	defer lastSubStatsMu.RUnlock()
+	stats := make([]SubNodeStat, len(lastSubStats))
+	copy(stats, lastSubStats)
+	return stats, lastTotalNodes, lastAliveNodes
+}
+
+// UpdateLastSubStatsNames 在 SaveConfig 渲染完 Proxy["name"] 后,
+// 用 results 中的最终展示名回填 lastSubStats 中各节点的 name 字段。
+func UpdateLastSubStatsNames(results []Result) {
+	lastSubStatsMu.Lock()
+	defer lastSubStatsMu.Unlock()
+	for i := range lastSubStats {
+		for j := range lastSubStats[i].Nodes {
+			idx := lastSubStats[i].resultIdx[j]
+			if idx < len(results) && results[idx].Proxy != nil {
+				if name, ok := results[idx].Proxy["name"].(string); ok {
+					lastSubStats[i].Nodes[j].Name = name
+				}
+			}
+		}
+	}
 }
 
 func ResetPhaseResults() {
@@ -430,6 +487,11 @@ func (pc *ProxyChecker) startAliveWorkers(ctx context.Context, n int, in <-chan 
 					continue
 				}
 				pc.incrementAvailable()
+				if subUrl, ok := t.proxy["sub_url"].(string); ok && subUrl != "" {
+					pc.aliveSubMu.Lock()
+					pc.aliveSubStats[subUrl]++
+					pc.aliveSubMu.Unlock()
+				}
 				select {
 				case <-ctx.Done():
 					return
@@ -535,12 +597,14 @@ func (pc *ProxyChecker) checkAlive(proxy map[string]any) *aliveResult {
 	}
 	defer httpClient.Close()
 
+	start := time.Now()
 	alive, err := platform.CheckAlive(httpClient.Client)
+	latency := int(time.Since(start).Milliseconds())
 	if err != nil || !alive {
 		return nil
 	}
 
-	return &aliveResult{Proxy: proxy}
+	return &aliveResult{Proxy: proxy, Latency: latency}
 }
 
 // checkSpeed 对已有的 Result 执行测速。
@@ -573,7 +637,7 @@ func (pc *ProxyChecker) checkSpeed(r Result, speedTestURL string) *Result {
 // 不会丢弃节点,不会修改 proxy["name"];检测结果写入 Result 的结构化字段。
 // Counter updates are owned by the caller (media pipeline worker).
 func (pc *ProxyChecker) checkMedia(a aliveResult) *Result {
-	res := &Result{Proxy: a.Proxy}
+	res := &Result{Proxy: a.Proxy, Latency: a.Latency}
 
 	if os.Getenv("SUB_CHECK_SKIP") != "" {
 		return res
@@ -733,9 +797,12 @@ func (pc *ProxyChecker) resetPhaseCounters(count int) {
 	FilterPassed.Store(0)
 	SpeedDone.Store(0)
 	SpeedOk.Store(0)
+
+	pc.aliveSubStats = make(map[string]int)
 }
 
-// checkSubscriptionSuccessRate 检查订阅成功率并发出警告
+// checkSubscriptionSuccessRate 检查订阅成功率并发出警告。
+// 同时在删除 sub_url 之前构建按订阅链接分组的统计缓存,供 Web UI 展示。
 func (pc *ProxyChecker) checkSubscriptionSuccessRate(allProxies []map[string]any) {
 	// 统计每个订阅的节点总数和成功数
 	subStats := make(map[string]struct {
@@ -743,32 +810,77 @@ func (pc *ProxyChecker) checkSubscriptionSuccessRate(allProxies []map[string]any
 		success int
 	})
 
+	// 按订阅链接分组的展示统计 (含 tag)
+	subMap := make(map[string]*SubNodeStat)
+
 	// 统计所有节点的订阅来源
 	for _, proxy := range allProxies {
 		if subUrl, ok := proxy["sub_url"].(string); ok {
 			stats := subStats[subUrl]
 			stats.total++
 			subStats[subUrl] = stats
+
+			// 构建/更新展示统计
+			subTag, _ := proxy["sub_tag"].(string)
+			stat, exists := subMap[subUrl]
+			if !exists {
+				stat = &SubNodeStat{URL: subUrl, Tag: subTag}
+				subMap[subUrl] = stat
+			}
+			stat.Total++
 		}
 	}
 
-	// 统计成功节点的订阅来源
-	for _, result := range pc.results {
-		if result.Proxy != nil {
-			if subUrl, ok := result.Proxy["sub_url"].(string); ok {
-				stats := subStats[subUrl]
-				stats.success++
-				subStats[subUrl] = stats
+	// 填充存活计数
+	pc.aliveSubMu.Lock()
+	for subUrl, count := range pc.aliveSubStats {
+		if stat, ok := subMap[subUrl]; ok {
+			stat.Alive = count
+		}
+	}
+	pc.aliveSubMu.Unlock()
+
+	// 统计成功节点的订阅来源,同时构建展示统计中的节点明细
+	for i := range pc.results {
+		result := &pc.results[i]
+		if result.Proxy == nil {
+			continue
+		}
+		if subUrl, ok := result.Proxy["sub_url"].(string); ok {
+			stats := subStats[subUrl]
+			stats.success++
+			subStats[subUrl] = stats
+
+			// 追加节点明细 (name 稍后由 UpdateLastSubStatsNames 填充)
+			if stat, ok := subMap[subUrl]; ok {
+				stat.Passed++
+				stat.Nodes = append(stat.Nodes, NodeDetail{
+					Country: result.Country,
+					Latency: result.Latency,
+					Speed:   result.Speed,
+				})
+				stat.resultIdx = append(stat.resultIdx, i)
 			}
-			delete(result.Proxy, "sub_url")
-			// 可以保持127.0.0.1:8199/sub/all.yaml中的节点tag
-			if subTag, ok := result.Proxy["sub_tag"].(string); ok {
-				if subTag == "" {
-					delete(result.Proxy, "sub_tag")
-				}
+		}
+		delete(result.Proxy, "sub_url")
+		// 可以保持127.0.0.1:8199/sub/all.yaml中的节点tag
+		if subTag, ok := result.Proxy["sub_tag"].(string); ok {
+			if subTag == "" {
+				delete(result.Proxy, "sub_tag")
 			}
 		}
 	}
+
+	// 缓存按订阅链接分组的统计数据到包级变量
+	statsList := make([]SubNodeStat, 0, len(subMap))
+	for _, stat := range subMap {
+		statsList = append(statsList, *stat)
+	}
+	lastSubStatsMu.Lock()
+	lastSubStats = statsList
+	lastTotalNodes = ProxyCount.Load()
+	lastAliveNodes = Available.Load()
+	lastSubStatsMu.Unlock()
 
 	// 检查成功率并发出警告
 	for subUrl, stats := range subStats {

@@ -13,11 +13,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gin-contrib/pprof"
+	"github.com/gin-gonic/gin"
 	"github.com/jadylc/subs-check/check"
 	"github.com/jadylc/subs-check/config"
 	"github.com/jadylc/subs-check/save/method"
-	"github.com/gin-contrib/pprof"
-	"github.com/gin-gonic/gin"
 	"gopkg.in/yaml.v3"
 )
 
@@ -87,6 +87,8 @@ func (app *App) initHttpServer() error {
 			api.GET("/status", app.getStatus)
 			api.POST("/trigger-check", app.triggerCheckHandler)
 			api.POST("/force-close", app.forceCloseHandler)
+			// 节点详情API
+			api.GET("/nodes", app.getNodes)
 			// 版本相关API
 			api.GET("/version", app.getVersion)
 
@@ -189,14 +191,14 @@ func (app *App) getStatus(c *gin.Context) {
 		"speedPass":  check.SpeedOk.Load(),
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"checking":      app.checking.Load(),
-		"proxyCount":    check.ProxyCount.Load(),
-		"available":     check.Available.Load(),
-		"progress":      check.Progress.Load(),
-		"phase":         check.Phase.Load(),
-		"phaseResults":  phaseResults,
-		"pipeline":      pipeline,
-		"hasSpeedTest":  config.GlobalConfig.SpeedTestUrl != "",
+		"checking":     app.checking.Load(),
+		"proxyCount":   check.ProxyCount.Load(),
+		"available":    check.Available.Load(),
+		"progress":     check.Progress.Load(),
+		"phase":        check.Phase.Load(),
+		"phaseResults": phaseResults,
+		"pipeline":     pipeline,
+		"hasSpeedTest": config.GlobalConfig.SpeedTestUrl != "",
 	})
 }
 
@@ -204,6 +206,39 @@ func (app *App) getStatus(c *gin.Context) {
 func (app *App) triggerCheckHandler(c *gin.Context) {
 	app.TriggerCheck()
 	c.JSON(http.StatusOK, gin.H{"message": "已触发检测"})
+}
+
+// getNodes 返回上一轮有效运行的按订阅链接分组的节点检测结果
+func (app *App) getNodes(c *gin.Context) {
+	subStats, total, alive := check.GetLastSubStats()
+
+	type subGroup struct {
+		URL    string             `json:"url"`
+		Tag    string             `json:"tag"`
+		Total  int                `json:"total"`
+		Alive  int                `json:"alive"`
+		Passed int                `json:"passed"`
+		Nodes  []check.NodeDetail `json:"nodes"`
+	}
+
+	groups := make([]subGroup, 0, len(subStats))
+	for _, s := range subStats {
+		groups = append(groups, subGroup{
+			URL:    s.URL,
+			Tag:    s.Tag,
+			Total:  s.Total,
+			Alive:  s.Alive,
+			Passed: s.Passed,
+			Nodes:  s.Nodes,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"total":  total,
+		"alive":  alive,
+		"passed": len(groups) > 0 && total > 0, // 标记是否有数据
+		"groups": groups,
+	})
 }
 
 // forceCloseHandler 强制关闭

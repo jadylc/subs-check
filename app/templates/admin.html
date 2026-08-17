@@ -141,6 +141,68 @@
             font-size: 0.9rem;
         }
 
+        /* 节点统计模块 */
+        .nodes-card .card-body { padding: 0; }
+        .nodes-header .nodes-chevron {
+            transition: transform 0.2s;
+            font-size: 0.8rem;
+        }
+        .nodes-header[aria-expanded="true"] .nodes-chevron {
+            transform: rotate(180deg);
+        }
+        .sub-group { border-bottom: 1px solid var(--border-color); }
+        .sub-group:last-child { border-bottom: none; }
+        .sub-group-header {
+            padding: 8px 12px;
+            cursor: pointer;
+            background-color: #f8f9fa;
+            font-size: 0.85rem;
+            font-weight: 600;
+            display: flex;
+            justify-content: between;
+            align-items: center;
+            gap: 8px;
+        }
+        .sub-group-header:hover { background-color: #eef1f5; }
+        .sub-group-header .sub-url {
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-weight: 400;
+            color: var(--text-secondary);
+        }
+        .sub-group-header .sub-badge {
+            font-size: 0.75rem;
+            padding: 1px 6px;
+            border-radius: 4px;
+            white-space: nowrap;
+        }
+        .sub-group-header .sub-chevron {
+            transition: transform 0.2s;
+            font-size: 0.75rem;
+        }
+        .sub-group-header[aria-expanded="true"] .sub-chevron {
+            transform: rotate(180deg);
+        }
+        .nodes-card .table {
+            font-size: 0.82rem;
+            margin-bottom: 0;
+        }
+        .nodes-card .table th {
+            font-weight: 600;
+            color: var(--text-secondary);
+            border-bottom: 1px solid var(--border-color);
+            white-space: nowrap;
+        }
+        .nodes-card .table td {
+            white-space: nowrap;
+        }
+        .nodes-card .table td:nth-child(2) {
+            white-space: normal;
+            word-break: break-all;
+        }
+
         /* 日志颜色样式 - 暗色主题 */
         .log-info { color: #a6e3a1; }
         .log-error { color: #f38ba8; }
@@ -545,6 +607,21 @@
                 </div>
             </div>
         </div>
+
+        <!-- 节点统计模块 -->
+        <div class="card nodes-card">
+            <div class="card-header nodes-header" id="nodesHeader" style="cursor: pointer;" data-bs-toggle="collapse" data-bs-target="#nodesBody" aria-expanded="false" aria-controls="nodesBody">
+                <div class="d-flex justify-content-between align-items-center">
+                    <span><i class="bi bi-diagram-3 me-1"></i>节点统计<i class="bi bi-chevron-down ms-1 nodes-chevron"></i></span>
+                    <span id="nodesSummary" class="text-muted small">暂无数据</span>
+                </div>
+            </div>
+            <div class="collapse" id="nodesBody">
+                <div class="card-body p-0" id="nodesContent">
+                    <div class="text-center text-muted p-3">暂无数据</div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <!-- Bootstrap JS -->
@@ -818,6 +895,74 @@
             });
         });
 
+        // 加载节点数据 (按订阅链接分组)
+        function loadNodes() {
+            return fetch('/api/nodes', {
+                headers: addApiKeyHeader()
+            })
+            .then(function(response) {
+                if (handleUnauthorized(response, false)) return;
+                return response.json();
+            })
+            .then(function(data) {
+                if (!data) return;
+                var summary = document.getElementById('nodesSummary');
+                var content = document.getElementById('nodesContent');
+
+                var totalGroups = (data.groups || []).length;
+                var totalPassed = 0;
+                (data.groups || []).forEach(function(g) { totalPassed += g.passed; });
+
+                if (totalGroups === 0) {
+                    summary.textContent = '暂无数据';
+                    content.innerHTML = '<div class="text-center text-muted p-3">暂无数据</div>';
+                    return;
+                }
+
+                summary.textContent = '总计 ' + data.total + ' | 存活 ' + data.alive + ' | 通过 ' + totalPassed;
+
+                var html = '';
+                (data.groups || []).forEach(function(g, gi) {
+                    var groupId = 'subNodes' + gi;
+                    var tagHtml = g.tag ? '<span class="sub-badge bg-info text-white">' + escapeHtml(g.tag) + '</span>' : '';
+                    html += '<div class="sub-group">';
+                    html += '<div class="sub-group-header" data-bs-toggle="collapse" data-bs-target="#' + groupId + '" aria-expanded="false" aria-controls="' + groupId + '">';
+                    html += '<i class="bi bi-chevron-down sub-chevron"></i>';
+                    html += '<span>总数 ' + g.total + ' | 存活 ' + g.alive + ' | 通过 ' + g.passed + '</span>';
+                    html += tagHtml;
+                    html += '<span class="sub-url" title="' + escapeHtml(g.url) + '">' + escapeHtml(g.url) + '</span>';
+                    html += '</div>';
+                    html += '<div class="collapse" id="' + groupId + '">';
+                    html += '<div class="table-responsive"><table class="table table-sm table-hover mb-0">';
+                    html += '<thead><tr><th style="width:40px;">#</th><th>节点名</th><th style="width:60px;">国家</th><th style="width:80px;">延迟</th><th style="width:100px;">速度</th></tr></thead><tbody>';
+                    if (g.nodes && g.nodes.length > 0) {
+                        g.nodes.forEach(function(node, ni) {
+                            var latencyText = node.latency > 0 ? node.latency + 'ms' : '-';
+                            var speedText = '-';
+                            if (node.speed > 0) {
+                                speedText = node.speed < 1024 ? node.speed + 'KB/s' : (node.speed / 1024).toFixed(1) + 'MB/s';
+                            }
+                            html += '<tr><td>' + (ni + 1) + '</td>';
+                            html += '<td>' + escapeHtml(node.name || '') + '</td>';
+                            html += '<td>' + escapeHtml(node.country || '') + '</td>';
+                            html += '<td>' + latencyText + '</td>';
+                            html += '<td>' + speedText + '</td></tr>';
+                        });
+                    } else {
+                        html += '<tr><td colspan="5" class="text-center text-muted">无通过节点</td></tr>';
+                    }
+                    html += '</tbody></table></div>';
+                    html += '</div>';
+                    html += '</div>';
+                });
+
+                content.innerHTML = html;
+            })
+            .catch(function(error) {
+                console.error('加载节点数据失败:', error);
+            });
+        }
+
         // 加载日志
         function loadLogs() {
             return fetch('/api/logs', {
@@ -1020,6 +1165,12 @@
             })
             .then(data => {
                 if (data) {
+                    // 检测完成(checking → idle)时自动刷新节点数据
+                    if (lastCheckingState && !data.checking) {
+                        loadNodes();
+                    }
+                    lastCheckingState = data.checking;
+
                     if (data.checking) {
                         dom.statusContainer.className = 'text-primary';
                         dom.statusIcon.className = 'bi bi-arrow-repeat me-1 rotate-animation';
@@ -1052,8 +1203,12 @@
         }
 
         // 初始加载
+        var lastCheckingState = false;
         updateStatus();
         loadLogs();
+        loadNodes();
+
+        // 检测状态转换: checking → idle 时自动刷新节点数据 (变量已在上方声明)
 
         // 检查API密钥
         const apiKey = localStorage.getItem('apiKey');

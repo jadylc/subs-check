@@ -10,13 +10,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/jadylc/subs-check/app/monitor"
 	"github.com/jadylc/subs-check/assets"
 	"github.com/jadylc/subs-check/check"
 	"github.com/jadylc/subs-check/config"
 	"github.com/jadylc/subs-check/save"
 	"github.com/jadylc/subs-check/utils"
-	"github.com/fsnotify/fsnotify"
 	"github.com/robfig/cron/v3"
 )
 
@@ -246,6 +246,8 @@ func (app *App) checkProxies() error {
 	}
 	slog.Info("检测完成")
 	save.SaveConfig(results)
+	// SaveConfig 渲染完 Proxy["name"] 后,回填按订阅链接分组的节点明细 name
+	check.UpdateLastSubStatsNames(results)
 	utils.SendNotify(len(results))
 	utils.UpdateSubs()
 
