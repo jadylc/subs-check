@@ -1,29 +1,15 @@
-FROM golang:alpine AS builder
-WORKDIR /app
-COPY . .
-ARG GITHUB_SHA
-ARG VERSION
-RUN apk add --no-cache nodejs zstd && \
-    ARCH=$(uname -m) && \
-    case "$ARCH" in \
-        "x86_64") zstd -f /usr/bin/node -o assets/node_linux_amd64.zst ;; \
-        "aarch64") zstd -f /usr/bin/node -o assets/node_linux_arm64.zst ;; \
-        "armv7l") zstd -f /usr/bin/node -o assets/node_linux_armv7.zst ;; \
-        *) echo "不支持的架构: $ARCH" && exit 1 ;; \
-    esac
-RUN echo "Building commit: ${GITHUB_SHA:0:7}" && \
-    go mod tidy && \
-    go build -ldflags="-s -w -X main.Version=${VERSION} -X main.CurrentCommit=${GITHUB_SHA:0:7}" -trimpath -o subs-check .
-
+# 纯运行时镜像 — 不再编译 Go，二进制由 goreleaser 预编译后通过 release.yml 放入 binaries/ 目录。
+# buildx 多平台构建时自动注入 TARGETARCH (amd64 / arm64 / arm)。
 FROM alpine
+ARG TARGETARCH
 WORKDIR /app
 ENV TZ=Asia/Shanghai
-RUN apk add --no-cache alpine-conf ca-certificates nodejs &&\
+RUN apk add --no-cache alpine-conf ca-certificates nodejs && \
     /usr/sbin/setup-timezone -z Asia/Shanghai && \
     apk del alpine-conf && \
-    rm -rf /var/cache/apk/* && \
-    rm -rf /usr/bin/node
-COPY --from=builder /app/subs-check /app/subs-check
+    rm -rf /var/cache/apk/*
+COPY binaries/subs-check-${TARGETARCH} /app/subs-check
+RUN chmod +x /app/subs-check
 CMD ["/app/subs-check"]
 EXPOSE 8199
 EXPOSE 8299
