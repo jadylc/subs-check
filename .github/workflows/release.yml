@@ -33,22 +33,20 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 用 find 搜索 goreleaser 产出的 linux 裸二进制，重命名到固定路径后上传。
-      - name: Collect linux binaries
+      # 直接交叉编译 3 个 linux 二进制供 Docker 使用，不依赖 goreleaser dist/ 目录结构。
+      # CGO_ENABLED=0 原生交叉编译，无需 QEMU，~30s 完成 3 个目标。
+      - name: Build linux binaries for Docker
         run: |
+          VERSION=${GITHUB_REF_NAME}
+          COMMIT=${GITHUB_SHA:0:7}
+          LDFLAGS="-s -w -X main.Version=${VERSION} -X main.CurrentCommit=${COMMIT}"
           mkdir -p linux-out
-          find dist -type f -name "subs-check" | while read f; do
-            dir=$(dirname "$f")
-            if echo "$dir" | grep -q 'arm64'; then
-              cp "$f" linux-out/subs-check-arm64
-            elif echo "$dir" | grep -q 'arm'; then
-              cp "$f" linux-out/subs-check-arm
-            elif echo "$dir" | grep -q 'amd64\|x86'; then
-              cp "$f" linux-out/subs-check-amd64
-            fi
-          done
-          echo "=== Collected binaries ==="
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="${LDFLAGS}" -o linux-out/subs-check-amd64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="${LDFLAGS}" -o linux-out/subs-check-arm64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -ldflags="${LDFLAGS}" -o linux-out/subs-check-arm .
+          echo "=== Built binaries ==="
           ls -la linux-out/
+          file linux-out/subs-check-*
 
       - name: Upload linux binaries
         uses: actions/upload-artifact@v4
