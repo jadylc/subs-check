@@ -12,7 +12,6 @@ builds:
       - amd64
       - arm64
       - arm
-      - "386"
     goarm:
       - "7"
     ignore:
@@ -20,8 +19,6 @@ builds:
         goarch: arm
       - goos: windows
         goarch: arm
-      - goos: darwin
-        goarch: "386"
     mod_timestamp: '{{ .CommitTimestamp }}'
     flags:
       - -trimpath
