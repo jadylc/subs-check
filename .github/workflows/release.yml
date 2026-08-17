@@ -32,16 +32,29 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 上传 linux 各架构裸二进制供 docker job 使用。
-      # download-artifact@v4 会保持这些相对路径: subs-check_Linux_x86_64/subs-check 等
+      # 用 find 搜索 goreleaser 产出的 linux 裸二进制，重命名到固定路径后上传。
+      # 不依赖 goreleaser dist/ 的具体目录命名（会随版本变化）。
+      - name: Collect linux binaries
+        run: |
+          mkdir -p linux-out
+          find dist -type f -name "subs-check" | while read f; do
+            dir=$(dirname "$f")
+            if echo "$dir" | grep -q 'arm64'; then
+              cp "$f" linux-out/subs-check-arm64
+            elif echo "$dir" | grep -q 'arm'; then
+              cp "$f" linux-out/subs-check-arm
+            elif echo "$dir" | grep -q 'amd64\|x86'; then
+              cp "$f" linux-out/subs-check-amd64
+            fi
+          done
+          echo "=== Collected binaries ==="
+          ls -la linux-out/
+
       - name: Upload linux binaries
         uses: actions/upload-artifact@v4
         with:
           name: linux-binaries
-          path: |
-            dist/subs-check_Linux_x86_64/subs-check
-            dist/subs-check_Linux_aarch64/subs-check
-            dist/subs-check_Linux_armv7/subs-check
+          path: linux-out/subs-check-*
 
   docker:
     runs-on: ubuntu-latest
@@ -56,16 +69,10 @@ jobs:
           name: linux-binaries
           path: binaries
 
-      # goreleaser 产出的二进制都叫 subs-check，按目录区分架构。
-      # download-artifact 保持上传时的相对路径: subs-check_Linux_x86_64/subs-check 等
-      # buildx 多平台构建时 Dockerfile 用 TARGETARCH (amd64/arm64/arm) 选择对应二进制
-      - name: Prepare binaries for buildx
-        run: |
-          cd binaries
-          mv subs-check_Linux_x86_64/subs-check subs-check-amd64
-          mv subs-check_Linux_aarch64/subs-check subs-check-arm64
-          mv subs-check_Linux_armv7/subs-check subs-check-arm
-          rm -rf subs-check_Linux_*
+      # 下载的文件已经是 subs-check-amd64 / subs-check-arm64 / subs-check-arm
+      # Dockerfile 用 TARGETARCH (amd64/arm64/arm) 匹配对应文件
+      - name: Verify binaries
+        run: ls -la binaries/
           
       - name: Docker meta
         id: meta
