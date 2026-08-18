@@ -925,11 +925,29 @@
                 (data.groups || []).forEach(function(g, gi) {
                     var groupId = 'subNodes' + gi;
                     var tagHtml = g.tag ? '<span class="sub-badge bg-info text-white">' + escapeHtml(g.tag) + '</span>' : '';
+                    // 流量信息
+                    var trafficHtml = '';
+                    if (g.traffic && g.traffic.total > 0) {
+                        var used = g.traffic.upload + g.traffic.download;
+                        var pct = (used / g.traffic.total * 100).toFixed(1);
+                        var usedStr = formatBytes(used);
+                        var totalStr = formatBytes(g.traffic.total);
+                        var pctColor = pct >= 90 ? 'bg-danger' : (pct >= 70 ? 'bg-warning' : 'bg-success');
+                        trafficHtml = '<span class="sub-badge ' + pctColor + ' text-white" title="已用 ' + usedStr + ' / 总量 ' + totalStr + '">' + pct + '%</span>';
+                        if (g.traffic.expire > 0) {
+                            var expDate = new Date(g.traffic.expire * 1000);
+                            var expStr = expDate.getFullYear() + '-' + String(expDate.getMonth()+1).padStart(2,'0') + '-' + String(expDate.getDate()).padStart(2,'0');
+                            var now = Date.now();
+                            var expColor = expDate.getTime() < now ? 'bg-danger' : (expDate.getTime() - now < 7*86400000 ? 'bg-warning' : 'bg-secondary');
+                            trafficHtml += '<span class="sub-badge ' + expColor + ' text-white" title="到期时间">到期 ' + expStr + '</span>';
+                        }
+                    }
                     html += '<div class="sub-group">';
                     html += '<div class="sub-group-header" data-bs-toggle="collapse" data-bs-target="#' + groupId + '" aria-expanded="false" aria-controls="' + groupId + '">';
                     html += '<i class="bi bi-chevron-down sub-chevron"></i>';
                     html += '<span>总数 ' + g.total + ' | 存活 ' + g.alive + ' | 通过 ' + g.passed + '</span>';
                     html += tagHtml;
+                    html += trafficHtml;
                     html += '<span class="sub-url" title="' + escapeHtml(g.url) + '">' + escapeHtml(g.url) + '</span>';
                     html += '</div>';
                     html += '<div class="collapse" id="' + groupId + '">';
@@ -1000,6 +1018,14 @@
 
         function escapeHtml(str) {
             return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        }
+
+        // 格式化字节数为人类可读
+        function formatBytes(bytes) {
+            if (bytes < 1024) return bytes + 'B';
+            if (bytes < 1048576) return (bytes/1024).toFixed(1) + 'KB';
+            if (bytes < 1073741824) return (bytes/1048576).toFixed(1) + 'MB';
+            return (bytes/1073741824).toFixed(2) + 'GB';
         }
 
         // 为日志添加颜色

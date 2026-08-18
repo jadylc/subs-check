@@ -213,23 +213,25 @@ func (app *App) getNodes(c *gin.Context) {
 	subStats, total, alive := check.GetLastSubStats()
 
 	type subGroup struct {
-		URL    string             `json:"url"`
-		Tag    string             `json:"tag"`
-		Total  int                `json:"total"`
-		Alive  int                `json:"alive"`
-		Passed int                `json:"passed"`
-		Nodes  []check.NodeDetail `json:"nodes"`
+		URL     string                `json:"url"`
+		Tag     string                `json:"tag"`
+		Total   int                   `json:"total"`
+		Alive   int                   `json:"alive"`
+		Passed  int                   `json:"passed"`
+		Traffic *check.SubTrafficInfo `json:"traffic,omitempty"`
+		Nodes   []check.NodeDetail    `json:"nodes"`
 	}
 
 	groups := make([]subGroup, 0, len(subStats))
 	for _, s := range subStats {
 		groups = append(groups, subGroup{
-			URL:    s.URL,
-			Tag:    s.Tag,
-			Total:  s.Total,
-			Alive:  s.Alive,
-			Passed: s.Passed,
-			Nodes:  s.Nodes,
+			URL:     s.URL,
+			Tag:     s.Tag,
+			Total:   s.Total,
+			Alive:   s.Alive,
+			Passed:  s.Passed,
+			Traffic: s.Traffic,
+			Nodes:   s.Nodes,
 		})
 	}
 

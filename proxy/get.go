@@ -30,6 +30,17 @@ type subEntry struct {
 	source string
 }
 
+// subUserinfoMap 缓存每个订阅链接的 Subscription-Userinfo 响应头
+var subUserinfoMap sync.Map
+
+// GetSubUserinfo 返回订阅链接的流量信息字符串(原始 header 值)
+func GetSubUserinfo(url string) string {
+	if v, ok := subUserinfoMap.Load(url); ok {
+		return v.(string)
+	}
+	return ""
+}
+
 func GetProxies() ([]map[string]any, error) {
 
 	// 解析本地与远程订阅清单
@@ -65,10 +76,13 @@ func GetProxies() ([]map[string]any, error) {
 			defer func() { <-concurrentLimit }() // 释放令牌
 
 			url := e.url
-			data, err := GetDateFromSubs(url)
+			data, userinfo, err := GetDateFromSubs(url)
 			if err != nil {
 				slog.Error("获取订阅链接错误跳过", "source", e.source, "url", url, "err", err)
 				return
+			}
+			if userinfo != "" {
+				subUserinfoMap.Store(url, userinfo)
 			}
 
 			var tag string
@@ -224,7 +238,7 @@ func fetchRemoteSubUrls(listURL string) ([]string, error) {
 	if listURL == "" {
 		return nil, errors.New("empty list url")
 	}
-	data, err := GetDateFromSubs(listURL)
+	data, _, err := GetDateFromSubs(listURL)
 	if err != nil {
 		return nil, err
 	}
@@ -251,8 +265,8 @@ func fetchRemoteSubUrls(listURL string) ([]string, error) {
 	return res, nil
 }
 
-// 订阅链接中获取数据
-func GetDateFromSubs(subUrl string) ([]byte, error) {
+// 订阅链接中获取数据,同时返回 Subscription-Userinfo 响应头
+func GetDateFromSubs(subUrl string) ([]byte, string, error) {
 	maxRetries := config.GlobalConfig.SubUrlsReTry
 	// 重试间隔
 	retryInterval := config.GlobalConfig.SubUrlsRetryInterval
@@ -316,15 +330,16 @@ func GetDateFromSubs(subUrl string) ([]byte, error) {
 		}
 
 		body, err := io.ReadAll(resp.Body)
+		userinfo := resp.Header.Get("Subscription-Userinfo")
 		resp.Body.Close()
 		if err != nil {
 			lastErr = fmt.Errorf("读取响应数据错误: %w", err)
 			continue
 		}
-		return body, nil
+		return body, userinfo, nil
 	}
 
-	return nil, fmt.Errorf("重试%d次后失败: %w", maxRetries, lastErr)
+	return nil, "", fmt.Errorf("重试%d次后失败: %w", maxRetries, lastErr)
 }
 
 // newMihomoDialer returns a DialContext that resolves via mihomo's global resolver

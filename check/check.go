@@ -11,6 +11,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -109,15 +110,34 @@ type NodeDetail struct {
 	Speed   int    `json:"speed"`   // KB/s, 0 表示未测速或未通过
 }
 
+// SubTrafficInfo 订阅流量信息,从 Subscription-Userinfo 响应头解析。
+type SubTrafficInfo struct {
+	Upload   int64 `json:"upload"`   // 已上传字节
+	Download int64 `json:"download"` // 已下载字节
+	Total    int64 `json:"total"`    // 流量上限字节, 0 表示无限制
+	Expire   int64 `json:"expire"`   // 过期时间戳(秒), 0 表示无过期
+}
+
+// Used 返回已用流量(字节)
+func (t SubTrafficInfo) Used() int64 {
+	return t.Upload + t.Download
+}
+
+// HasTraffic 是否有流量信息
+func (t SubTrafficInfo) HasTraffic() bool {
+	return t.Total > 0 || t.Upload > 0 || t.Download > 0
+}
+
 // SubNodeStat 按订阅链接维度的节点统计。
 type SubNodeStat struct {
-	URL       string       `json:"url"`
-	Tag       string       `json:"tag"`
-	Total     int          `json:"total"`  // 该订阅的总节点数
-	Alive     int          `json:"alive"`  // 该订阅的存活节点数
-	Passed    int          `json:"passed"` // 该订阅通过全部检测的节点数
-	Nodes     []NodeDetail `json:"nodes"`
-	resultIdx []int        // 不导出 JSON;记录每个 node 在 results slice 中的位置,用于后续更新 name
+	URL       string          `json:"url"`
+	Tag       string          `json:"tag"`
+	Total     int             `json:"total"`  // 该订阅的总节点数
+	Alive     int             `json:"alive"`  // 该订阅的存活节点数
+	Passed    int             `json:"passed"` // 该订阅通过全部检测的节点数
+	Traffic   *SubTrafficInfo `json:"traffic,omitempty"`
+	Nodes     []NodeDetail    `json:"nodes"`
+	resultIdx []int           // 不导出 JSON;记录每个 node 在 results slice 中的位置,用于后续更新 name
 }
 
 // 包级缓存: 上一轮有效运行的按订阅链接分组的统计数据。
@@ -801,6 +821,40 @@ func (pc *ProxyChecker) resetPhaseCounters(count int) {
 	pc.aliveSubStats = make(map[string]int)
 }
 
+// parseSubUserinfo 解析 Subscription-Userinfo 响应头。
+// 格式: upload=123; download=456; total=789; expire=1671815872
+func parseSubUserinfo(header string) *SubTrafficInfo {
+	if header == "" {
+		return nil
+	}
+	info := &SubTrafficInfo{}
+	for _, part := range strings.Split(header, ";") {
+		part = strings.TrimSpace(part)
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		val, err := strconv.ParseInt(strings.TrimSpace(kv[1]), 10, 64)
+		if err != nil {
+			continue
+		}
+		switch strings.TrimSpace(kv[0]) {
+		case "upload":
+			info.Upload = val
+		case "download":
+			info.Download = val
+		case "total":
+			info.Total = val
+		case "expire":
+			info.Expire = val
+		}
+	}
+	if !info.HasTraffic() {
+		return nil
+	}
+	return info
+}
+
 // checkSubscriptionSuccessRate 检查订阅成功率并发出警告。
 // 同时在删除 sub_url 之前构建按订阅链接分组的统计缓存,供 Web UI 展示。
 func (pc *ProxyChecker) checkSubscriptionSuccessRate(allProxies []map[string]any) {
@@ -825,6 +879,8 @@ func (pc *ProxyChecker) checkSubscriptionSuccessRate(allProxies []map[string]any
 			stat, exists := subMap[subUrl]
 			if !exists {
 				stat = &SubNodeStat{URL: subUrl, Tag: subTag}
+				// 解析 Subscription-Userinfo 流量信息
+				stat.Traffic = parseSubUserinfo(proxyutils.GetSubUserinfo(subUrl))
 				subMap[subUrl] = stat
 			}
 			stat.Total++
