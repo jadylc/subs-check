@@ -33,6 +33,15 @@ type subEntry struct {
 // subUserinfoMap 缓存每个订阅链接的 Subscription-Userinfo 响应头
 var subUserinfoMap sync.Map
 
+// ResetSubUserinfoMap 清空订阅流量信息缓存
+// 在每轮 GetProxies 开始时调用，避免已移除的订阅 URL 条目残留导致内存增长
+func ResetSubUserinfoMap() {
+	subUserinfoMap.Range(func(key, _ any) bool {
+		subUserinfoMap.Delete(key)
+		return true
+	})
+}
+
 // GetSubUserinfo 返回订阅链接的流量信息字符串(原始 header 值)
 func GetSubUserinfo(url string) string {
 	if v, ok := subUserinfoMap.Load(url); ok {
@@ -42,6 +51,9 @@ func GetSubUserinfo(url string) string {
 }
 
 func GetProxies() ([]map[string]any, error) {
+
+	// 清空上一轮的订阅流量信息缓存，避免已移除的订阅 URL 条目残留
+	ResetSubUserinfoMap()
 
 	// 解析本地与远程订阅清单
 	subUrls, localNum, remoteNum := resolveSubUrls()
@@ -300,6 +312,8 @@ func GetDateFromSubs(subUrl string) ([]byte, string, error) {
 		Timeout:   time.Duration(timeout) * time.Second,
 		Transport: transport,
 	}
+	// 函数返回时关闭空闲连接，避免 transport 的 idle conn 积压导致内存不释放
+	defer client.CloseIdleConnections()
 
 	for i := range maxRetries {
 		if i > 0 {

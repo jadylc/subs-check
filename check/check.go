@@ -1041,6 +1041,7 @@ func (pc *ProxyClient) Close() {
 	// 某些底层传输协议的 Close 可能阻塞，超时后放弃等待交由 GC 回收
 	if pc.proxy != nil {
 		proxy := pc.proxy
+		pc.proxy = nil // 先置 nil 释放 ProxyClient 对 proxy 的引用，帮助 GC 回收
 		done := make(chan struct{})
 		go func() {
 			proxy.Close()
@@ -1050,6 +1051,8 @@ func (pc *ProxyClient) Close() {
 		case <-done:
 		case <-time.After(5 * time.Second):
 			slog.Debug(fmt.Sprintf("关闭代理连接超时，交由GC回收: %v", proxy))
+			// goroutine 仍持有 proxy 引用直到 Close() 返回，无法从外部干预
+			// 但 ProxyClient 侧的引用已释放，不影响其被 GC
 		}
 	}
 	pc.Client = nil
