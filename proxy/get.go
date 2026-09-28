@@ -292,33 +292,37 @@ func GetDateFromSubs(subUrl string) ([]byte, string, error) {
 	}
 	var lastErr error
 
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-		},
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+	// 代理访问与直连访问各使用一个独立的 transport：
+	// 之前所有尝试(含重试)都固定走环境代理(ProxyFromEnvironment)，订阅地址对代理
+	// 不友好(或代理暂时不可用)时重试多少次都会失败。现在交替尝试：奇数次走代理，
+	// 偶数次直连(不带代理)，提高获取成功率。
+	timeoutDur := time.Duration(timeout) * time.Second
+
+	proxyClient := &http.Client{
+		Timeout:   timeoutDur,
+		Transport: newSubsTransport(true, timeoutDur),
 	}
-	// Route DNS through the configured mihomo resolver so subscription domains aren't leaked to system DNS.
-	// Only when user enabled custom DNS — keeps default behavior unchanged for existing users.
-	if config.GlobalConfig.DNS.Enable {
-		transport.DialContext = newMihomoDialer(time.Duration(timeout) * time.Second)
-	}
-	client := &http.Client{
-		Timeout:   time.Duration(timeout) * time.Second,
-		Transport: transport,
+	directClient := &http.Client{
+		Timeout:   timeoutDur,
+		Transport: newSubsTransport(false, timeoutDur),
 	}
 	// 函数返回时关闭空闲连接，避免 transport 的 idle conn 积压导致内存不释放
-	defer client.CloseIdleConnections()
+	defer proxyClient.CloseIdleConnections()
+	defer directClient.CloseIdleConnections()
 
 	for i := range maxRetries {
 		if i > 0 {
 			time.Sleep(time.Duration(retryInterval) * time.Second)
 		}
+
+		// 奇数次尝试走直连，偶数次尝试走代理
+		client := proxyClient
+		mode := "代理"
+		if i%2 == 1 {
+			client = directClient
+			mode = "直连"
+		}
+		slog.Debug("访问订阅链接", "url", subUrl, "尝试", i+1, "方式", mode)
 
 		req, err := http.NewRequest("GET", subUrl, nil)
 		if err != nil {
@@ -354,6 +358,31 @@ func GetDateFromSubs(subUrl string) ([]byte, string, error) {
 	}
 
 	return nil, "", fmt.Errorf("重试%d次后失败: %w", maxRetries, lastErr)
+}
+
+// newSubsTransport 构建订阅获取用的 http.Transport。
+// useProxy 为 true 时走环境代理(ProxyFromEnvironment)，false 时直连。
+// dialTimeout 只在用户启用自定义 DNS 时用于 mihomo resolver 拨号。
+func newSubsTransport(useProxy bool, dialTimeout time.Duration) *http.Transport {
+	t := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	if useProxy {
+		t.Proxy = http.ProxyFromEnvironment
+	}
+	// Route DNS through the configured mihomo resolver so subscription domains aren't leaked to system DNS.
+	// Only when user enabled custom DNS — keeps default behavior unchanged for existing users.
+	if config.GlobalConfig.DNS.Enable {
+		t.DialContext = newMihomoDialer(dialTimeout)
+	}
+	return t
 }
 
 // newMihomoDialer returns a DialContext that resolves via mihomo's global resolver
