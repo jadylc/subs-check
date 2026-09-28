@@ -10,56 +10,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// ---- loadExistingAllProxies ----
-
-func TestLoadExistingAllProxies_MissingFile(t *testing.T) {
-	dir := t.TempDir()
-	oldOutputDir := config.GlobalConfig.OutputDir
-	config.GlobalConfig.OutputDir = dir
-	defer func() { config.GlobalConfig.OutputDir = oldOutputDir }()
-
-	got := loadExistingAllProxies()
-	if got != nil {
-		t.Fatalf("expected nil for missing file, got %v", got)
-	}
-}
-
-func TestLoadExistingAllProxies_ValidFile(t *testing.T) {
-	dir := t.TempDir()
-	oldOutputDir := config.GlobalConfig.OutputDir
-	config.GlobalConfig.OutputDir = dir
-	defer func() { config.GlobalConfig.OutputDir = oldOutputDir }()
-
-	if err := os.WriteFile(filepath.Join(dir, "all.yaml"), []byte("proxies:\n  - name: n1\n    server: 1.2.3.4\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	got := loadExistingAllProxies()
-	if len(got) != 1 {
-		t.Fatalf("expected 1 proxy, got %d", len(got))
-	}
-	if got[0]["name"] != "n1" {
-		t.Errorf("unexpected first proxy: %v", got[0])
-	}
-}
-
-func TestLoadExistingAllProxies_InvalidFile(t *testing.T) {
-	dir := t.TempDir()
-	oldOutputDir := config.GlobalConfig.OutputDir
-	config.GlobalConfig.OutputDir = dir
-	defer func() { config.GlobalConfig.OutputDir = oldOutputDir }()
-
-	if err := os.WriteFile(filepath.Join(dir, "all.yaml"), []byte("::: not yaml :::"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	got := loadExistingAllProxies()
-	if got != nil {
-		t.Fatalf("expected nil for invalid yaml, got %v", got)
-	}
-}
-
-// ---- SaveConfig 增量合并 ----
+// 按链接缓存方案下不再有 all.yaml 全局增量合并:
+// 失败链接的节点由 proxy 层按链接缓存兜底,
+// 保存层只序列化本轮结果。因此 loadExistingAllProxies
+// 及相关增量合并测试已删除,保留 0 节点轮次的跳过保存语义测试。
 
 // 构造一个最小可保存的 Result,避免依赖 RenderName 的媒体/测速字段
 func mergeTestResult(name, server string, port int) check.Result {
@@ -86,7 +40,8 @@ func readAllYamlProxies(t *testing.T, dir string) []map[string]any {
 	return doc.Proxies
 }
 
-func TestSaveConfig_IncrementalMergeKeepsExisting(t *testing.T) {
+// 保存层只序列化本轮结果:上一轮已有节点不再被合并带回。
+func TestSaveConfig_SerializesOnlyThisRound(t *testing.T) {
 	dir := t.TempDir()
 	oldOutputDir := config.GlobalConfig.OutputDir
 	oldSaveMethod := config.GlobalConfig.SaveMethod
@@ -113,8 +68,8 @@ func TestSaveConfig_IncrementalMergeKeepsExisting(t *testing.T) {
 		t.Fatalf("first round expected 2 proxies, got %d", len(first))
 	}
 
-	// 第二轮: 只有 B（与已有重复）以及新节点 C。
-	// A 在第二轮已不在订阅结果中,但增量合并应保留 A。
+	// 第二轮: 只有 B 与 C。A 已不在本轮结果中(如对应链接被删除或获取失败),
+	// 不再有全局增量合并,因此 A 不应出现在 all.yaml 中。
 	SaveConfig([]check.Result{
 		mergeTestResult("B", "5.6.7.8", 443),
 		mergeTestResult("C", "9.9.9.9", 443),
@@ -127,16 +82,20 @@ func TestSaveConfig_IncrementalMergeKeepsExisting(t *testing.T) {
 			gotNames[n] = true
 		}
 	}
-	for _, want := range []string{"A", "B", "C"} {
+	if gotNames["A"] {
+		t.Errorf("all.yaml should not contain removed node A, got %v", gotNames)
+	}
+	for _, want := range []string{"B", "C"} {
 		if !gotNames[want] {
-			t.Errorf("merged all.yaml missing %q, got %v", want, gotNames)
+			t.Errorf("all.yaml missing %q, got %v", want, gotNames)
 		}
 	}
-	if len(second) != 3 {
-		t.Errorf("expected 3 deduplicated proxies, got %d: %v", len(second), second)
+	if len(second) != 2 {
+		t.Errorf("expected 2 proxies, got %d: %v", len(second), second)
 	}
 }
 
+// 0 节点轮次跳过保存,不清空已有 all.yaml。
 func TestSaveConfig_NoOverwriteWhenEmptyRound(t *testing.T) {
 	dir := t.TempDir()
 	oldOutputDir := config.GlobalConfig.OutputDir
@@ -159,7 +118,7 @@ func TestSaveConfig_NoOverwriteWhenEmptyRound(t *testing.T) {
 		mergeTestResult("A", "1.2.3.4", 443),
 	})
 
-	// 下一轮 0 节点: 不应清空 all.yaml,应保留上一轮节点
+	// 下一轮 0 节点: 跳过保存, all.yaml 保留上一轮内容
 	SaveConfig(nil)
 
 	kept := readAllYamlProxies(t, dir)

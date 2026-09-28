@@ -5,12 +5,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
-	"path/filepath"
 
 	"github.com/jadylc/subs-check/check"
 	"github.com/jadylc/subs-check/config"
-	proxyutils "github.com/jadylc/subs-check/proxy"
 	"github.com/jadylc/subs-check/save/method"
 	"github.com/jadylc/subs-check/utils"
 	"gopkg.in/yaml.v3"
@@ -26,16 +23,19 @@ type SaveFunc func(data []byte, filename string) error
 //     history 文件天然干净,keep-days 下次加载时不会累积标签)
 //  2. 然后原地 mutate 每个 result.Proxy["name"] 为最终展示名
 //     (调 check.RenderName 生成 base + 媒体标签 + 速度标签 + sub_tag)
-//  3. 增量合并:加载本地已有的 all.yaml 节点,与本轮结果合并去重,
-//     避免直接覆盖丢点(如某轮订阅获取失败或返回节点变少)。
-//     合并后序列化成 all.yaml、mihomo.yaml、base64.txt
+//  3. 结果直接序列化成 all.yaml、mihomo.yaml、base64.txt
 //     并写本地 / 远程 / SubStore
+//
+// 节点兜底不再在保存层做:某个订阅链接本轮获取失败时,
+// proxy 层会用该链接自己的缓存节点参与检测,保证结果完整性;
+// 链接从配置删除后对应缓存被清理,因此这里不再合并历史 all.yaml
+// (旧的全量增量合并会把已删除链接的节点重新带回来)。
 //
 // 隐式契约: SaveConfig 调用后 results 视为已消费,调用方不应再读
 // results[i].Proxy["name"](那已经是展示名,不是原始名)。
 func SaveConfig(results []check.Result) {
 	// ① 先写 history,此时 proxy["name"] 仍是原始值,history yaml 天然干净
-	// 0 节点时不上历史快照(空快照没有意义),但已有节点合并逻辑仍会兜底保留存量
+	// 0 节点时不上历史快照(空快照没有意义)
 	if len(results) > 0 && config.GlobalConfig.KeepDays > 0 {
 		historyYamlData, err := marshalProxies(results)
 		if err != nil {
@@ -53,21 +53,14 @@ func SaveConfig(results []check.Result) {
 		results[i].Proxy["name"] = check.RenderName(results[i], true)
 	}
 
-	// ③ 增量合并:本轮结果 + 本地已有 all.yaml 节点,合并去重后统一序列化。
-	// 这样即便本轮订阅失败/节点变少,也不会直接覆盖掉上一轮保存的好节点。
+	// ③ 本轮检测通过(含失败链接的缓存兜底节点)的结果直接序列化保存。
 	merged := make([]map[string]any, 0, len(results))
 	for _, r := range results {
 		if r.Proxy != nil {
 			merged = append(merged, r.Proxy)
 		}
 	}
-	existing := loadExistingAllProxies()
-	if len(existing) > 0 {
-		merged = append(merged, existing...)
-		merged = proxyutils.DeduplicateProxies(merged)
-		slog.Info(fmt.Sprintf("增量合并节点: 本轮 %d 个, 已有 %d 个, 合并去重后 %d 个",
-			len(results), len(existing), len(merged)))
-	}
+	slog.Info(fmt.Sprintf("本轮可保存节点: %d", len(merged)))
 
 	if len(merged) == 0 {
 		slog.Warn("本轮与已有均没有可保存的节点，跳过保存")
@@ -158,33 +151,6 @@ func saveIfNotEmpty(saver SaveFunc, data []byte, filename string) {
 	if err := saver(data, filename); err != nil {
 		slog.Error(fmt.Sprintf("保存%s到%s失败: %v", filename, config.GlobalConfig.SaveMethod, err))
 	}
-}
-
-// loadExistingAllProxies 读取本地 output 目录下已保存的 all.yaml 节点列表。
-// 用于增量更新:把上一轮已保存的节点与本轮结果合并去重,避免某轮订阅
-// 获取失败/节点变少时直接覆盖掉存量节点。文件不存在或解析失败时返回 nil。
-func loadExistingAllProxies() []map[string]any {
-	saver, err := method.NewLocalSaver()
-	if err != nil {
-		slog.Error(fmt.Sprintf("获取本地保存器失败: %v", err))
-		return nil
-	}
-	path := filepath.Join(saver.OutputPath, "all.yaml")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			slog.Warn(fmt.Sprintf("读取本地 all.yaml 失败: %v", err))
-		}
-		return nil
-	}
-	var doc struct {
-		Proxies []map[string]any `yaml:"proxies"`
-	}
-	if err := yaml.Unmarshal(data, &doc); err != nil {
-		slog.Warn(fmt.Sprintf("解析本地 all.yaml 失败: %v", err))
-		return nil
-	}
-	return doc.Proxies
 }
 
 // newRemoteSaver 根据配置创建远程保存方法

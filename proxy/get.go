@@ -56,8 +56,18 @@ func GetProxies() ([]map[string]any, error) {
 	ResetSubUserinfoMap()
 
 	// 解析本地与远程订阅清单
-	subUrls, localNum, remoteNum := resolveSubUrls()
+	subUrls, localNum, remoteNum, activeRemote, failedRemote := resolveSubUrls()
 	slog.Info("订阅链接数量", "本地", localNum, "远程", remoteNum, "总计", len(subUrls))
+
+	// 清理已移除链接的缓存:
+	// 本地配置中删掉的链接 / 成功获取的远程清单中不再出现的链接, 对应缓存删除;
+	// 本轮获取失败的远程清单不做清理, 避免网络抖动误删缓存。
+	// activeLocal 与 resolveSubUrls 同样做 trim, 保证与缓存 key(trim 后原始 URL) 一致。
+	activeLocal := make([]string, 0, len(config.GlobalConfig.SubUrls))
+	for _, u := range config.GlobalConfig.SubUrls {
+		activeLocal = append(activeLocal, strings.TrimSpace(u))
+	}
+	CleanupSubCaches(activeLocal, activeRemote, failedRemote)
 
 	if len(config.GlobalConfig.NodeType) > 0 {
 		slog.Info("只筛选用户设置的协议", "type", config.GlobalConfig.NodeType)
@@ -83,14 +93,28 @@ func GetProxies() ([]map[string]any, error) {
 		wg.Add(1)
 		concurrentLimit <- struct{}{} // 获取令牌
 
-		go func(i int, e subEntry) {
+		go func(i int, e subEntry, rawURL string) {
 			defer wg.Done()
 			defer func() { <-concurrentLimit }() // 释放令牌
 
 			url := e.url
+
+			// fallback 尝试用该链接自己的缓存节点顶上参与后续检测。
+			// 订阅获取/解析失败时, 用该链接最近一次成功获取的节点继续,
+			// 避免一次网络抖动就丢光一个订阅源的所有节点。
+			// 缓存 key 用原始 URL(未经过 WarpUrl), 保证跨轮次稳定:
+			// WarpUrl 会展开时间占位符({Ymd})并加 github 代理前缀, 不能作 key。
+			fallback := func() {
+				if cached := LoadSubCache(rawURL); len(cached) > 0 {
+					buckets[i] = cached
+					slog.Warn("订阅链接获取失败,已使用该链接缓存节点", "source", e.source, "url", url, "count", len(cached))
+				}
+			}
+
 			data, userinfo, err := GetDateFromSubs(url)
 			if err != nil {
 				slog.Error("获取订阅链接错误跳过", "source", e.source, "url", url, "err", err)
+				fallback()
 				return
 			}
 			if userinfo != "" {
@@ -118,6 +142,7 @@ func GetProxies() ([]map[string]any, error) {
 				proxyList, err := convert.ConvertsV2Ray(data)
 				if err != nil {
 					slog.Error("解析proxy错误", "source", e.source, "url", url, "err", err)
+					fallback()
 					return
 				}
 				slog.Debug("获取订阅链接", "source", e.source, "url", url, "count", len(proxyList))
@@ -137,6 +162,12 @@ func GetProxies() ([]map[string]any, error) {
 					}
 					local = append(local, proxy)
 				}
+				if len(local) == 0 {
+					// 获取成功但解析/过滤后没有节点, 同样用缓存顶上
+					fallback()
+					return
+				}
+				SaveSubCache(rawURL, e.source, local)
 				buckets[i] = local
 				return
 			}
@@ -144,11 +175,13 @@ func GetProxies() ([]map[string]any, error) {
 			proxyInterface, ok := con["proxies"]
 			if !ok || proxyInterface == nil {
 				slog.Error("订阅链接没有proxies", "source", e.source, "url", url)
+				fallback()
 				return
 			}
 
 			proxyList, ok := proxyInterface.([]any)
 			if !ok {
+				fallback()
 				return
 			}
 			slog.Debug("获取订阅链接", "source", e.source, "url", url, "count", len(proxyList))
@@ -178,8 +211,14 @@ func GetProxies() ([]map[string]any, error) {
 					local = append(local, proxyMap)
 				}
 			}
+			if len(local) == 0 {
+				// 获取成功但没有可用节点(如过滤后为空), 用缓存顶上
+				fallback()
+				return
+			}
+			SaveSubCache(rawURL, e.source, local)
 			buckets[i] = local
-		}(idx, subEntry{url: utils.WarpUrl(subUrl.url), source: subUrl.source})
+		}(idx, subEntry{url: utils.WarpUrl(subUrl.url), source: subUrl.source}, subUrl.url)
 	}
 
 	// 等待所有工作协程完成
@@ -199,10 +238,14 @@ func GetProxies() ([]map[string]any, error) {
 }
 
 // from 3k
-// resolveSubUrls 合并本地与远程订阅清单并去重
-func resolveSubUrls() ([]subEntry, int, int) {
+// resolveSubUrls 合并本地与远程订阅清单并去重。
+// 返回值:
+//   - subUrls: 去重后的订阅链接条目(本地在前, 远程在后)
+//   - localNum / remoteNum: 本地/远程链接数量
+//   - activeRemote: 本轮成功获取的远程清单 url -> 该清单返回的链接列表
+//   - failedRemote: 本轮获取失败的远程清单 url 集合(其子链接缓存需保留)
+func resolveSubUrls() (subUrls []subEntry, localNum, remoteNum int, activeRemote map[string][]string, failedRemote map[string]bool) {
 	// 计数
-	var localNum, remoteNum int
 	localNum = len(config.GlobalConfig.SubUrls)
 
 	entries := make([]subEntry, 0, len(config.GlobalConfig.SubUrls))
@@ -212,13 +255,27 @@ func resolveSubUrls() ([]subEntry, int, int) {
 	}
 
 	// 远程清单
+	activeRemote = make(map[string][]string)
+	failedRemote = make(map[string]bool)
 	if len(config.GlobalConfig.SubUrlsRemote) != 0 {
 		for _, d := range config.GlobalConfig.SubUrlsRemote {
 			if remote, err := fetchRemoteSubUrls(utils.WarpUrl(d)); err != nil {
 				slog.Warn("获取远程订阅清单失败，已忽略", "url", d, "err", err)
+				failedRemote[d] = true
 			} else {
-				remoteNum += len(remote)
+				// 与下方去重逻辑用同一 trim/过滤口径, 保证 activeRemote 中的链接
+				// 与缓存 key(trim 后原始 URL) 一致, 清理时才不会误删。
+				trimmed := make([]string, 0, len(remote))
 				for _, u := range remote {
+					u = strings.TrimSpace(u)
+					if u == "" || strings.HasPrefix(u, "#") {
+						continue
+					}
+					trimmed = append(trimmed, u)
+				}
+				remoteNum += len(trimmed)
+				activeRemote[d] = trimmed
+				for _, u := range trimmed {
 					entries = append(entries, subEntry{url: u, source: d})
 				}
 			}
@@ -239,7 +296,7 @@ func resolveSubUrls() ([]subEntry, int, int) {
 		seen[s] = struct{}{}
 		out = append(out, subEntry{url: s, source: e.source})
 	}
-	return out, localNum, remoteNum
+	return out, localNum, remoteNum, activeRemote, failedRemote
 }
 
 // fetchRemoteSubUrls 从远程地址读取订阅URL清单
